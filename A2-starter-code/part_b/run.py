@@ -53,6 +53,8 @@ def run(args, visualize = True):
     env = HighwayEnv()
     agent = Agent(env, discount_factor= df)
     
+    os.makedirs(output_dir, exist_ok=True)
+    
 
     # Set timeout
     signal.signal(signal.SIGALRM, timeout_handler)
