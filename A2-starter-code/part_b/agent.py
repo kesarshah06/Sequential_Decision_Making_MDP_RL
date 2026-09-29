@@ -8,7 +8,6 @@ ACTION_DECREASE_SPEED = 1
 ACTION_INCREASE_LANE = 2
 ACTION_DECREASE_LANE = 3
 ACTION_NO_OP = 4
-
 # ........................ Q-Learning Highway Agent ........................
 class Agent:
 
