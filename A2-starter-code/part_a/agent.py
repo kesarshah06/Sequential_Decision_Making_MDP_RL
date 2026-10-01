@@ -60,40 +60,39 @@ class Agent:
         for p in self.land:
             self.land_mask[self._idx(p)] = True
 
+        self.p1_area = list(self.env.pirate_areas[0])
+        self.p2_area = list(self.env.pirate_areas[1])
+        self.n1 = len(self.p1_area)
+        self.n2 = len(self.p2_area)
+        self.p1_to_idx = {p: i for i, p in enumerate(self.p1_area)}
+        self.p2_to_idx = {p: i for i, p in enumerate(self.p2_area)}
+
         self._build_ship_transitions()
         self._build_pirate_transitions()
 
-        self.V = np.zeros((4, self.C), dtype=np.float64)
-
-        
-        self.policy = np.zeros((4, self.C), dtype=np.int8)
+        self.V = np.zeros((4, self.n1, self.n2, self.C), dtype=np.float64)
+        self.policy = np.zeros((4, self.n1, self.n2, self.C), dtype=np.int8)
 
         self.ready = False
 
     def _idx(self, p):
-            return p[0] * self.N + p[1]
-    
+        return p[0] * self.N + p[1]
+
     def _pos(self, idx):
         return divmod(int(idx), self.N)
 
     def _valid_ship(self, p):
         i, j = p
-
         if i < 0 or i >= self.N:
             return False
-
         if j < 0 or j >= self.N:
             return False
-
         if p in self.land:
             return False
-
         return True
 
     def _build_ship_transitions(self):
-
         self.ship_next = np.empty((4, 4, self.C), dtype=np.int32)
-
         self.ship_prob = np.empty((4, 4), dtype=np.float64)
 
         deltas = (
@@ -104,42 +103,22 @@ class Agent:
         )
 
         for action in self.ACTIONS:
-
             self.ship_prob[action, 0] = self.ps
             self.ship_prob[action, 1:] = ((1.0 - self.ps) / 3.0)
 
-            other_actions = [
-                a for a in self.ACTIONS
-                if a != action
-            ]
-
+            other_actions = [a for a in self.ACTIONS if a != action]
             outcomes = [action] + other_actions
 
             for s in range(self.C):
-
                 p = self._pos(s)
-
                 for k, real_action in enumerate(outcomes):
-
                     di, dj = deltas[real_action]
-
                     q = (p[0] + di, p[1] + dj)
-
-                    # invalid movement -> remain where we are
                     if not self._valid_ship(q):
                         q = p
-
                     self.ship_next[action, k, s] = self._idx(q)
 
     def _build_pirate_transitions(self):
-    
-        # pirate_next[0] -> Pirate 1
-        # pirate_next[1] -> Pirate 2
-        #
-        # Each position maps to:
-        # ((next_position, probability), ...)
-        self.pirate_next = [{}, {}]
-
         deltas = (
             (1, 0),
             (-1, 0),
@@ -147,235 +126,102 @@ class Agent:
             (0, 1)
         )
 
-        for pirate in (0, 1):
+        self.P1 = np.zeros((self.n1, self.n1), dtype=np.float64)
+        for i, pos in enumerate(self.p1_area):
+            for action, prob in enumerate(self.pirate_prob[0]):
+                if prob == 0.0:
+                    continue
+                q = (pos[0] + deltas[action][0], pos[1] + deltas[action][1])
+                if q not in self.p1_to_idx:
+                    q = pos
+                self.P1[i, self.p1_to_idx[q]] += prob
 
-            allowed = set(self.env.pirate_areas[pirate])
+        self.P2 = np.zeros((self.n2, self.n2), dtype=np.float64)
+        for i, pos in enumerate(self.p2_area):
+            for action, prob in enumerate(self.pirate_prob[1]):
+                if prob == 0.0:
+                    continue
+                q = (pos[0] + deltas[action][0], pos[1] + deltas[action][1])
+                if q not in self.p2_to_idx:
+                    q = pos
+                self.P2[i, self.p2_to_idx[q]] += prob
 
-            probabilities = self.pirate_prob[pirate]
+        # Precompute collision probabilities: col_prob[i1, i2, s_prime]
+        self.col_prob = np.zeros((self.n1, self.n2, self.C), dtype=np.float64)
+        for i1, p1 in enumerate(self.p1_area):
+            for s_prime in self.p1_area:
+                s_idx = self._idx(s_prime)
+                self.col_prob[i1, :, s_idx] = self.P1[i1, self.p1_to_idx[s_prime]]
+        for i2, p2 in enumerate(self.p2_area):
+            for s_prime in self.p2_area:
+                s_idx = self._idx(s_prime)
+                self.col_prob[:, i2, s_idx] = self.P2[i2, self.p2_to_idx[s_prime]]
 
-            table = self.pirate_next[pirate]
-
-            for position in allowed:
-
-                distribution = {}
-
-                for action, probability in enumerate(probabilities):
-
-                    if probability == 0.0:
-                        continue
-
-                    q = (position[0] + deltas[action][0],
-                        position[1] + deltas[action][1])
-
-                    # Invalid pirate movement -> stay
-                    if q not in allowed:
-                        q = position
-
-                    distribution[q] = (distribution.get(q, 0.0) + probability)
-
-
-                table[position] = tuple(distribution.items())
-
-    def _pirate_dist(self, position, pirate):
-        return dict(self.pirate_next[pirate][tuple(position)])
+        # Precompute immediate expected reward: ImmR[mask, i1, i2, s_prime]
+        self.ImmR = np.zeros((4, self.n1, self.n2, self.C), dtype=np.float64)
+        for m in range(4):
+            self.ImmR[m] = self.rewards["step"] + self.col_prob * self.rewards["pirate"]
+            self.ImmR[m, :, :, self.fort_idx] += self.rewards["fort"]
+            for p, bit in self.tresure_to_bit.items():
+                if m & bit:
+                    t_idx = self._idx(p)
+                    self.ImmR[m, :, :, t_idx] += self.rewards["treasure"]
 
     def _mask(self, treasures):
-
         mask = 0
-
         for p in treasures:
-
-            bit = self.tresure_to_bit.get(
-                tuple(p)
-            )
-
+            bit = self.tresure_to_bit.get(tuple(p))
             if bit is not None:
                 mask |= bit
-
         return mask
 
-    def _bellman_action(self, mask, action, values):
-
-        q = np.zeros(self.C, dtype=np.float64)
-
-        for k in range(4):
-
-            probability = self.ship_prob[action, k]
-
-            if probability == 0.0:
-                continue
-
-            nxt = self.ship_next[action, k] 
-            
-
-            bits = self.tresure_bit[nxt]
-
-            # If we move onto a remaining treasure,
-            # remove it from the state.
-            next_mask = (mask & (~bits.astype(np.int64))) & 3
-
-            reward = np.full(self.C, self.rewards["step"], dtype=np.float64)
-
-            has_treasure = ((bits & mask) != 0)
-
-            reward[has_treasure] += (self.rewards["treasure"])
-
-            reward[nxt == self.fort_idx] += self.rewards["fort"]
-
-            continuation = values[next_mask, nxt]
-
-            # Fort is terminal
-            continuation[nxt == self.fort_idx] = 0.0
-
-            q += probability * (reward + self.gamma * continuation)
-
-        q[self.land_mask] = -np.inf
-
-        return q
-
-    def _compute_base_values(self):
-    
-        # There are only four possible treasure masks:
-        #
-        # 00 -> no treasures remain
-        # 01 -> treasure 1 remains
-        # 10 -> treasure 2 remains
-        # 11 -> both remain
-        #
-        # A transition that collects a treasure moves from a mask
-        # to a mask with fewer bits. Therefore we solve masks in
-        # increasing number of remaining treasures.
-
+    def _compute_full_values(self):
         masks = sorted(range(4), key=lambda x: x.bit_count())
+        W = np.zeros((4, self.n1, self.n2, self.C), dtype=np.float64)
 
         for mask in masks:
+            rem_treasures = [p for p, bit in self.tresure_to_bit.items() if mask & bit]
 
-            v = self.V[mask]
+            for _ in range(2000):
+                W[mask] = np.einsum('ia,jb,abs->ijs', self.P1, self.P2, self.V[mask])
+                Cont = self.gamma * W[mask].copy()
 
-            v[:] = 0.0
-            v[self.land_mask] = 0.0
-            v[self.fort_idx] = 0.0
+                for p in rem_treasures:
+                    t_idx = self._idx(p)
+                    next_mask = mask ^ self.tresure_to_bit[p]
+                    Cont[:, :, t_idx] = self.gamma * W[next_mask, :, :, t_idx]
 
-            for _ in range(1600):
+                Cont[:, :, self.fort_idx] = 0.0
 
-                old = v.copy()
+                Target = self.ImmR[mask] + Cont
 
-                qs = np.stack(
-                    [self._bellman_action(
-                            mask,
-                            action,
-                            self.V)
-                        for action in self.ACTIONS
-                    ],
-                    axis=0
-                )
+                Q = np.zeros((4, self.n1, self.n2, self.C), dtype=np.float64)
+                for a in self.ACTIONS:
+                    for k in range(4):
+                        prob = self.ship_prob[a, k]
+                        if prob > 0.0:
+                            Q[a] += prob * Target[:, :, self.ship_next[a, k]]
 
-                v[:] = np.max(qs, axis=0)
+                new_v = np.max(Q, axis=0)
 
-                v[self.land_mask] = 0.0
-                v[self.fort_idx] = 0.0
+                # Terminal states in V
+                new_v[:, :, self.land_mask] = 0.0
+                new_v[:, :, self.fort_idx] = 0.0
+                for i1, p1 in enumerate(self.p1_area):
+                    new_v[i1, :, self._idx(p1)] = 0.0
+                for i2, p2 in enumerate(self.p2_area):
+                    new_v[:, i2, self._idx(p2)] = 0.0
 
-                if np.max(np.abs(v - old)) < 1e-9:
+                diff = np.max(np.abs(new_v - self.V[mask]))
+                self.V[mask] = new_v
+
+                if diff < 1e-8:
                     break
 
-            # Extract greedy policy
-            qs = np.stack(
-                [self._bellman_action(
-                        mask,
-                        action,
-                        self.V)
-                    for action in self.ACTIONS],
-                axis=0
-            )
+            # Extract optimal policy for this mask
+            self.policy[mask] = np.argmax(Q, axis=0).astype(np.int8)
+            W[mask] = np.einsum('ia,jb,abs->ijs', self.P1, self.P2, self.V[mask])
 
-            self.policy[mask] = (np.argmax(qs, axis=0).astype(np.int8))
-
-    def _future_risk(self, start_idx, mask, p1_dist, p2_dist, horizon=7):
-
-        # Distribution over:
-        # (ship_position, treasure_mask)
-        ship = {(start_idx, mask): 1.0}
-
-        d1 = p1_dist
-        d2 = p2_dist
-
-        exposure = 0.0
-        survival = 1.0
-
-        for t in range(1,   horizon + 1):
-
-            # Pirates move first.
-            next_d1 = {}
-            next_d2 = {}
-
-            for p, probability in d1.items():
-
-                for q, pq in self.pirate_next[0][p]:
-
-                    next_d1[q] = (next_d1.get(q, 0.0)+ probability * pq)
-
-            for p, probability in d2.items():
-
-                for q, pq in self.pirate_next[1][p]:
-
-                    next_d2[q] = (next_d2.get(q, 0.0) + probability * pq)
-
-            d1 = next_d1
-            d2 = next_d2
-
-            new_ship = {}
-            collision_mass = 0.0
-
-            for (s, m), ship_probability in ship.items():
-
-                action = int(self.policy[m, s])
-
-                for k in range(4):
-
-                    action_probability = (self.ship_prob[action, k])
-
-                    if action_probability == 0.0:
-                        continue
-
-                    ns = int(self.ship_next[action, k, s])
-
-                    # Reaching fort terminates successfully.
-                    if ns == self.fort_idx:
-                        continue
-
-                    position = self._pos(ns)
-
-                    pirate_probability = (d1.get(position, 0.0) + d2.get(position, 0.0))
-
-                    mass = (ship_probability * action_probability)
-
-
-                    collision_mass += (mass * pirate_probability)
-
-                    safe_mass = (mass * (1.0 - pirate_probability))
-
-                    if safe_mass == 0.0:
-                        continue
-
-                    next_mask = (m & (~int(self.tresure_bit[ns])))
-
-                    key = (ns, next_mask)
-
-                    new_ship[key] = (new_ship.get(key, 0.0) + safe_mass)
-
-            exposure += (survival * collision_mass * (self.gamma ** t))
-
-            survival *= max(0.0, 1.0 - collision_mass)
-
-            ship = new_ship
-
-            if not ship:
-                break
-
-        return exposure
-
-
-    
     def get_action(self, ship_location, pirate_locations, treasure_locations) -> int:
         """
         Choose an action for the current state.
@@ -383,34 +229,35 @@ class Agent:
         Args:
             ship_location: Tuple (x, y) representing the current
                 location of the ship.
-
             pirate_locations: List containing the locations of all
                 pirates. There can be at most 2 pirates.
-
             treasure_locations: List containing the locations of all
                 treasures. There can be at most 2 treasures.
 
         Returns:
             An integer representing the selected action:
-
                 0 -> UP
                 1 -> DOWN
                 2 -> LEFT
                 3 -> RIGHT
-
-        Note:
-            This function may be called multiple times after
-            `learn_policy()` has been executed.
         """
-
         if not self.ready:
             self.learn_policy(1.0)
 
         ship_idx = self._idx(tuple(ship_location))
         mask = self._mask(treasure_locations)
 
-        return int(self.policy[mask, ship_idx])
+        p1_loc = tuple(pirate_locations[0])
+        p2_loc = tuple(pirate_locations[1])
 
+        if p1_loc in self.p1_to_idx:
+            p1_i = self.p1_to_idx[p1_loc]
+            p2_i = self.p2_to_idx.get(p2_loc, 0)
+        else:
+            p1_i = self.p1_to_idx.get(p2_loc, 0)
+            p2_i = self.p2_to_idx.get(p1_loc, 0)
+
+        return int(self.policy[mask, p1_i, p2_i, ship_idx])
 
     def learn_policy(self, time):
         """
@@ -418,16 +265,6 @@ class Agent:
 
         Args:
             time: Maximum time (in seconds) allowed for learning.
-
-        The learned policy should be stored internally by the agent
-        and subsequently used by `get_action()`.
-
-        Returns:
-            None
         """
-
-        # TODO
-
-        self._compute_base_values()
-        
+        self._compute_full_values()
         self.ready = True
