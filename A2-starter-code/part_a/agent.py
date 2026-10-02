@@ -1,5 +1,6 @@
 from env import TreasureHunt
 import numpy as np
+import time
 
 class Agent:
 
@@ -146,6 +147,16 @@ class Agent:
                     q = pos
                 self.P2[i, self.p2_to_idx[q]] += prob
 
+        for i in range(self.n1):
+            s = np.sum(self.P1[i])
+            if s > 0.0:
+                self.P1[i] /= s
+
+        for i in range(self.n2):
+            s = np.sum(self.P2[i])
+            if s > 0.0:
+                self.P2[i] /= s
+
         # Precompute collision probabilities: col_prob[i1, i2, s_prime]
         self.col_prob = np.zeros((self.n1, self.n2, self.C), dtype=np.float64)
         for i1, p1 in enumerate(self.p1_area):
@@ -175,14 +186,19 @@ class Agent:
                 mask |= bit
         return mask
 
-    def _compute_full_values(self):
+    def _compute_full_values(self, time_budget=1.0):
+        t_start = time.time()
+        deadline = t_start + max(0.01, 0.85 * float(time_budget))
+
         masks = sorted(range(4), key=lambda x: x.bit_count())
         W = np.zeros((4, self.n1, self.n2, self.C), dtype=np.float64)
 
-        for mask in masks:
+        for m_idx, mask in enumerate(masks):
+            rem_masks = len(masks) - m_idx
+            mask_deadline = time.time() + (deadline - time.time()) / rem_masks
             rem_treasures = [p for p, bit in self.tresure_to_bit.items() if mask & bit]
 
-            for _ in range(2000):
+            for _ in range(500):
                 W[mask] = np.einsum('ia,jb,abs->ijs', self.P1, self.P2, self.V[mask])
                 Cont = self.gamma * W[mask].copy()
 
@@ -214,12 +230,12 @@ class Agent:
 
                 diff = np.max(np.abs(new_v - self.V[mask]))
                 self.V[mask] = new_v
+                self.policy[mask] = np.argmax(Q, axis=0).astype(np.int8)
 
-                if diff < 1e-8:
+                if diff < 1e-4 or time.time() >= mask_deadline:
                     break
 
-            # Extract optimal policy for this mask
-            self.policy[mask] = np.argmax(Q, axis=0).astype(np.int8)
+            # Update continuation matrix W[mask]
             W[mask] = np.einsum('ia,jb,abs->ijs', self.P1, self.P2, self.V[mask])
 
     def get_action(self, ship_location, pirate_locations, treasure_locations) -> int:
@@ -266,5 +282,5 @@ class Agent:
         Args:
             time: Maximum time (in seconds) allowed for learning.
         """
-        self._compute_full_values()
+        self._compute_full_values(time)
         self.ready = True
