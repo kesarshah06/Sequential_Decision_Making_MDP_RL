@@ -15,15 +15,15 @@ FLIP_ACTION = (0, 1, 3, 2, 4)
 
 
 class Agent:
+    #..................................................initialize the agent..................................................
     def __init__(self, env: HighwayEnv, discount_factor=0.99):
-        self.env = env
-        self.discount_factor = discount_factor
-        self.num_actions = 5
-        self.Q = {}
-        self.N = {}
+        self.env = env                                                                            # Highway environment used for training
+        self.discount_factor = discount_factor                                                      # Discount factor for future rewards
+        self.num_actions = 5                                                                        # Number of available actions
+        self.Q = {}                                                                                 # Q-values for each encoded state
+        self.N = {}                                                                                 # Visit counts for each state-action pair
         
-        # Hyperparameters for sample-efficient tabular learning
-        self.n_steps = 3
+        self.n_steps = 3                                                                          # Number of steps used in multi-step updates
         self.replay_ratio = 3
         self.replay_cap = 200000
         self.opt_horizon = 20
@@ -35,42 +35,43 @@ class Agent:
         self.q0 = 0.0
         self.tol = 0.0
         
-        # Distance mapping for discrete state aggregation
-        self._own_map = (3, 1, 2, 3, 3)   # 0 = empty lane -> far distance
-        self._adj_map = (3, 1, 1, 3, 3)
-        self._wall = 9
-        self.total_steps = 0
+        self._own_map = (3, 1, 2, 3, 3)                                                           # Mapping for obstacles in the current lane
+        self._adj_map = (3, 1, 1, 3, 3)                                                           # Mapping for obstacles in adjacent lanes
+        self._wall = 9                                                                             # Sentinel value for unavailable lanes
+        self.total_steps = 0                                                                       # Total number of training steps
 
+    #..................................................encode the state using discretized sensor inputs..................................................
     def encode_state(self, speed, lane, min_dist):
         """
         Discretizes sensor inputs and orders adjacent lane obstacle distances 
         consistently to exploit horizontal left-right lane symmetry.
         """
-        lane = int(lane)
-        own = self._own_map[int(min_dist[lane])]
-        left = self._adj_map[int(min_dist[lane - 1])] if lane > 0 else self._wall
-        right = self._adj_map[int(min_dist[lane + 1])] if lane < 3 else self._wall
-        speed_flag = 1 if int(speed) >= 3 else 0
-        
-        # Canonicalize state representation if left side has more space than right
-        if left > right:
+        lane = int(lane)                                                                           # Ensure the lane index is an integer
+        own = self._own_map[int(min_dist[lane])]                                                    # Aggregate distance in the current lane
+        left = self._adj_map[int(min_dist[lane - 1])] if lane > 0 else self._wall                 # Aggregate distance in the left lane
+        right = self._adj_map[int(min_dist[lane + 1])] if lane < 3 else self._wall                # Aggregate distance in the right lane
+        speed_flag = 1 if int(speed) >= 3 else 0                                                   # Encode high-speed status
+
+        if left > right:                                                                           # Canonicalize state when the left side has more space
             state_key = (speed_flag * 10 + own) * 100 + right * 10 + left
             return state_key, True
         
         state_key = (speed_flag * 10 + own) * 100 + left * 10 + right
         return state_key, False
 
+    #..................................................get Q-values and visit counts for a state..................................................
     def _get_q_values(self, state):
         """Retrieves Q-values and visit counts, initializing with optimistic q0."""
-        if state not in self.Q:
-            self.Q[state] = [self.q0] * 5
-            self.N[state] = [0] * 5
+        if state not in self.Q:                                                                    # Initialize unseen states with optimistic values
+            self.Q[state] = [self.q0] * 5                                                          # Optimistic Q-values encourage exploration
+            self.N[state] = [0] * 5                                                                # Start action visit counts at zero
         return self.Q[state]
 
+    #..................................................select a greedy action from the Q-values..................................................
     def _select_greedy_action(self, q_values):
         """Greedy action selection with tie-breaking preference for maintaining high speed."""
-        max_q = max(q_values)
-        if q_values[ACTION_INCREASE_SPEED] >= max_q - self.tol:
+        max_q = max(q_values)                                                                       # Find the best estimated action value
+        if q_values[ACTION_INCREASE_SPEED] >= max_q - self.tol:                                    # Prefer increasing speed when nearly tied
             return ACTION_INCREASE_SPEED
             
         for action in (ACTION_NO_OP, ACTION_DECREASE_SPEED, ACTION_INCREASE_LANE, ACTION_DECREASE_LANE):
@@ -78,11 +79,12 @@ class Agent:
                 return action
         return ACTION_NO_OP
 
+    #..................................................probe the environment to estimate the reward scale..................................................
     def _probe_reward_scale(self):
         """Briefly probes environment at startup to calculate optimistic initialization values."""
-        probe_env = HighwayEnv()
-        probe_env.reset(seed=random.randrange(2 ** 31))
-        max_reward = 0.0
+        probe_env = HighwayEnv()                                                                   # Use a separate environment for probing
+        probe_env.reset(seed=random.randrange(2 ** 31))                                           # Randomize the probe start state
+        max_reward = 0.0                                                                           # Track the largest observed reward
         for _ in range(6):
             _, reward, done = probe_env.step(ACTION_INCREASE_SPEED)
             max_reward = max(max_reward, reward)
@@ -90,6 +92,7 @@ class Agent:
                 break
         return max_reward if max_reward > 0 else 0.1
 
+    #..................................................learn a policy with tabular Q-learning..................................................
     def learn_policy(self, time_limit: float):
         start_time = time.time()
         margin = 0.35 if time_limit >= 5 else 0.03
@@ -97,8 +100,7 @@ class Agent:
         gamma = self.discount_factor
         n_steps = self.n_steps
 
-        # Compute optimistic initial Q-value bound
-        rmax = self._probe_reward_scale()
+        rmax = self._probe_reward_scale()                                                          # Estimate the reward scale for initialization
         if gamma < 1.0:
             self.q0 = rmax * (1.0 - gamma ** self.opt_horizon) / (1.0 - gamma)
             self.tol = self.tie_frac * rmax / (1.0 - gamma)
@@ -116,8 +118,7 @@ class Agent:
             if elapsed >= max_duration:
                 break
                 
-            # Time-decaying epsilon exploration
-            epsilon = max(self.eps_min, self.eps_initial * (1.0 - elapsed / max_duration))
+            epsilon = max(self.eps_min, self.eps_initial * (1.0 - elapsed / max_duration))       # Reduce exploration as training time elapses
 
             env = HighwayEnv()
             speed, lane, min_dist = env.reset(seed=random.randrange(2 ** 31))
@@ -125,7 +126,6 @@ class Agent:
             done = False
             trajectory = []
 
-            # --- Episode Rollout ---
             while not done:
                 steps += 1
                 if (steps % 16 == 0) and (time.time() - start_time >= max_duration):
@@ -138,20 +138,18 @@ class Agent:
                 else:
                     action = self._select_greedy_action(q_vals)
 
-                # Execute action (mirroring lane change if state was flipped)
                 env_action = FLIP_ACTION[action] if is_flipped else action
                 (next_speed, next_lane, next_min_dist), reward, done = env.step(env_action)
                 next_state, next_is_flipped = self.encode_state(next_speed, next_lane, next_min_dist)
                 
-                is_terminal = bool(done and reward < 0)  # Crash event
-                next_q_vals = self._get_q_values(next_state)
-                target = reward if is_terminal else reward + gamma * max(next_q_vals)
+                is_terminal = bool(done and reward < 0)                                           # Identify crash terminations
+                next_q_vals = self._get_q_values(next_state)                                      # Retrieve next-state estimates
+                target = reward if is_terminal else reward + gamma * max(next_q_vals)              # Compute the temporal-difference target
                 
-                # 1-step Q-learning update
-                counts = self.N[state]
-                alpha = max(self.lr_min, self.lr_c / (self.lr_c + counts[action]))
-                counts[action] += 1
-                q_vals[action] += alpha * (target - q_vals[action])
+                counts = self.N[state]                                                            # Retrieve visit counts for the current state
+                alpha = max(self.lr_min, self.lr_c / (self.lr_c + counts[action]))                # Use a decaying learning rate
+                counts[action] += 1                                                               # Record this action visit
+                q_vals[action] += alpha * (target - q_vals[action])                               # Apply the one-step Q-learning update
 
                 trajectory.append((state, action, reward, next_state, is_terminal))
                 state, is_flipped = next_state, next_is_flipped
@@ -160,7 +158,6 @@ class Agent:
             if traj_len == 0:
                 continue
 
-            # --- Multi-step (n-step) Backward Sweep Updates ---
             for _ in range(2):
                 for t in range(traj_len - 1, -1, -1):
                     G = 0.0
@@ -186,7 +183,6 @@ class Agent:
                     counts[a_t] += 1
                     self.Q[s_t][a_t] += alpha * (G - self.Q[s_t][a_t])
 
-            # --- Experience Replay Updates ---
             for transition in trajectory:
                 if len(replay_buffer) < self.replay_cap:
                     replay_buffer.append(transition)
@@ -208,6 +204,7 @@ class Agent:
 
         self.total_steps = steps
 
+    #..................................................get the best action for the current state..................................................
     def get_action(self, speed, lane, min_dist) -> int:
         state, is_flipped = self.encode_state(speed, lane, min_dist)
         q_values = self._get_q_values(state)

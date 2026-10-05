@@ -20,15 +20,12 @@ class Agent:
             layout_file: Path to the grid layout file.
             prob_file: Path to the file containing environment probabilities.
 
-        You may use this function to:
             - Read and store the grid layout.
             - Read and store transition probabilities.
             - Identify important locations such as the fort.
             - Construct the state space and transition model.
             - Initialize any data structures required for learning.
         """
-
-        # TODO
 
         self.env = TreasureHunt(layout_file, prob_file)
 
