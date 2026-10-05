@@ -23,9 +23,8 @@ class Agent:
         self.Q = {}                                                                               # q-values for each encoded state
         self.N = {}                                                                               # visit counts for each state-action pair (online only)
 
-        self.n_steps = 4                                                                          # multi-step return horizon
-        self.replay_ratio = 4                                                                     # replay updates per trajectory step
-        self.replay_cap = 300000                                                                  # maximum replay buffer size
+        self.horizon = 4                                                                          # multi-step lookahead horizon
+        self.num_iterations = 3                                                                   # number of multi-step iterations per episode
         self.opt_horizon = 25                                                                     # horizon for optimistic q-initialization
         self.eps_start = 0.40                                                                     # initial exploration rate
         self.eps_min = 0.01                                                                       # minimum exploration rate
@@ -121,7 +120,7 @@ class Agent:
         margin = 0.35 if time >= 5 else 0.03
         max_dur = max(0.05, time - margin)
         gamma = self.df
-        horizon = self.n_steps
+        horizon = self.horizon
 
         rmax = self._probe_reward_scale()                                                          # estimate the reward scale for initialization
         if gamma < 1.0:
@@ -131,8 +130,6 @@ class Agent:
             self.q0 = rmax * self.opt_horizon
             self.tol = 0.0
 
-        buffer = []
-        buf_idx = 0
         total_steps = 0
         episodes = 0
         stop = False
@@ -184,8 +181,8 @@ class Agent:
             if t_len == 0:
                 continue
 
-            num_sweeps = 3
-            for _sweep in range(num_sweeps):
+            # multi step with 3 iteration over the trajectory
+            for _iter in range(self.num_iterations):
                 for t in range(t_len - 1, -1, -1):
                     G = 0.0
                     disc = 1.0
@@ -207,27 +204,8 @@ class Agent:
                     s_t, a_t = traj[t][0], traj[t][1]
                     counts_t = self.N[s_t]
                     alpha = max(self.lr_floor, self.lr_c / (self.lr_c + counts_t[a_t]))
-                    swp_alpha = alpha * 0.7                                                        # slightly reduced to avoid instability
-                    self.Q[s_t][a_t] += swp_alpha * (G - self.Q[s_t][a_t])
-
-            for trans in traj:
-                if len(buffer) < self.replay_cap:
-                    buffer.append(trans)
-                else:
-                    buffer[buf_idx] = trans
-                    buf_idx = (buf_idx + 1) % self.replay_cap
-
-            b_size = len(buffer)
-            n_replays = int(self.replay_ratio * t_len)
-            for _ in range(n_replays):
-                s_i, a_i, r_i, ns_i, term_i = buffer[random.randrange(b_size)]
-                nq_i = self._get_q_values(ns_i)
-                targ_i = r_i if term_i else r_i + gamma * max(nq_i)
-
-                counts = self.N[s_i]
-                alpha = max(self.lr_floor, self.lr_c / (self.lr_c + counts[a_i]))
-                rep_alpha = alpha * 0.5                                                            # reduced rate for replay stability
-                self.Q[s_i][a_i] += rep_alpha * (targ_i - self.Q[s_i][a_i])
+                    iter_alpha = alpha * 0.7                                                       # slightly reduced learning rate for trajectory iterations
+                    self.Q[s_t][a_t] += iter_alpha * (G - self.Q[s_t][a_t])
 
         self.total_steps = total_steps
 

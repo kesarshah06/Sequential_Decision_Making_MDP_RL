@@ -50,8 +50,8 @@ alpha = max(0.1, 2 / (2 + N(s,a)))
 
 Updates use:
 1-step Q-learning after every step.
-3-step returns, computed backwards twice per episode.
-Experience replay from a circular buffer of capacity 200k, with 3 x episode-length additional samples after each episode.
+Multi step with 3 iteration updates over the episode trajectory.
+
 
 Functions
 -init: Initialises Q, visit counts, and hyperparameters. O(1)
