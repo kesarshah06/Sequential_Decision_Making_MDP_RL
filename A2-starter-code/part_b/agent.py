@@ -1,155 +1,215 @@
-import numpy as np
+import random
 import time
+import numpy as np
+
 from env import HighwayEnv
 
-# Action constants
 ACTION_INCREASE_SPEED = 0
 ACTION_DECREASE_SPEED = 1
 ACTION_INCREASE_LANE = 2
 ACTION_DECREASE_LANE = 3
 ACTION_NO_OP = 4
 
-class Agent:
-    """
-    Model-Free Tabular Reinforcement Learning Agent for Highway Navigation.
-    
-    1. Temporal Difference (TD) Q-Learning Updates 
-    2. Multi-Pass TD Trajectory Propagation for Data-Efficient Credit Assignment 
-    3. Monte Carlo Discounted Return (G) Backpropagation for Terminal Crashes 
-    4. Active RL with Epsilon-Greedy Strategy & Decaying Alpha/Epsilon 
-    """
+# Action mirror mapping to exploit left-right lane symmetry
+FLIP_ACTION = (0, 1, 3, 2, 4)
 
+
+class Agent:
     def __init__(self, env: HighwayEnv, discount_factor=0.99):
         self.env = env
         self.discount_factor = discount_factor
-
-        self.num_speeds = 4
-        self.num_lanes = 4
-        self.dist_states = 5
-        # Total state space size: 4 speeds * 4 lanes * (5 distances ^ 4 lanes) = 10,000 states
-        self.num_states = self.num_speeds * self.num_lanes * (self.dist_states ** 4)
         self.num_actions = 5
-
-        # Q-Table Q(s, a) initialized to 0 (Slide 44)
-        self.q_table = np.zeros((self.num_states, self.num_actions), dtype=np.float64)
-
-        # Learning Hyperparameters (Slides 45, 48)
-        self.alpha_initial = 0.45
-        self.alpha_min = 0.03
-        self.epsilon_initial = 1.0
-        self.epsilon_min = 0.01
-
-    # .................... Encode State Tuple to Index .....................
-    def encode_state(self, speed, lane, min_dist) -> int:
-        return (int(speed) * 2500 + int(lane) * 625 +
-                int(min_dist[0]) * 125 + int(min_dist[1]) * 25 +
-                int(min_dist[2]) * 5 + int(min_dist[3]))
-
-    # .................. Epsilon-Greedy Action Selection (Slide 48) ...................
-    def select_action(self, state_idx: int, epsilon: float) -> int:
-        if np.random.rand() < epsilon:
-            return int(np.random.randint(self.num_actions))
-        return self._greedy_action(state_idx)
-
-    # ...................... Greedy Action Selection (Slide 38) .......................
-    def _greedy_action(self, state_idx: int) -> int:
-        q_vals = self.q_table[state_idx]
-        max_val = np.max(q_vals)
-        best_actions = np.where(q_vals == max_val)[0]
+        self.Q = {}
+        self.N = {}
         
-        if len(best_actions) == 1:
-            return int(best_actions[0])
+        # Hyperparameters for sample-efficient tabular learning
+        self.n_steps = 3
+        self.replay_ratio = 3
+        self.replay_cap = 200000
+        self.opt_horizon = 20
+        self.eps_initial = 0.5
+        self.eps_min = 0.02
+        self.lr_c = 2.0
+        self.lr_min = 0.1
+        self.tie_frac = 0.01
+        self.q0 = 0.0
+        self.tol = 0.0
+        
+        # Distance mapping for discrete state aggregation
+        self._own_map = (3, 1, 2, 3, 3)   # 0 = empty lane -> far distance
+        self._adj_map = (3, 1, 1, 3, 3)
+        self._wall = 9
+        self.total_steps = 0
 
-        # Safety-first tie-breaking for unvisited / tied states:
-        if max_val == 0.0:
-            if ACTION_NO_OP in best_actions:
-                return ACTION_NO_OP
-            if ACTION_INCREASE_SPEED in best_actions:
-                return ACTION_INCREASE_SPEED
+    def encode_state(self, speed, lane, min_dist):
+        """
+        Discretizes sensor inputs and orders adjacent lane obstacle distances 
+        consistently to exploit horizontal left-right lane symmetry.
+        """
+        lane = int(lane)
+        own = self._own_map[int(min_dist[lane])]
+        left = self._adj_map[int(min_dist[lane - 1])] if lane > 0 else self._wall
+        right = self._adj_map[int(min_dist[lane + 1])] if lane < 3 else self._wall
+        speed_flag = 1 if int(speed) >= 3 else 0
+        
+        # Canonicalize state representation if left side has more space than right
+        if left > right:
+            state_key = (speed_flag * 10 + own) * 100 + right * 10 + left
+            return state_key, True
+        
+        state_key = (speed_flag * 10 + own) * 100 + left * 10 + right
+        return state_key, False
 
-        return int(np.random.choice(best_actions))
+    def _get_q_values(self, state):
+        """Retrieves Q-values and visit counts, initializing with optimistic q0."""
+        if state not in self.Q:
+            self.Q[state] = [self.q0] * 5
+            self.N[state] = [0] * 5
+        return self.Q[state]
 
-    # .................... Temporal Difference (TD) Step (Slides 28-31, 42-44) ....................
-    def update_q_value(self, state_idx: int, action: int, reward: float, next_state_idx: int, done: bool, alpha: float) -> float:
-        if done:
-            target = reward
-        else:
-            target = reward + self.discount_factor * np.max(self.q_table[next_state_idx])
+    def _select_greedy_action(self, q_values):
+        """Greedy action selection with tie-breaking preference for maintaining high speed."""
+        max_q = max(q_values)
+        if q_values[ACTION_INCREASE_SPEED] >= max_q - self.tol:
+            return ACTION_INCREASE_SPEED
+            
+        for action in (ACTION_NO_OP, ACTION_DECREASE_SPEED, ACTION_INCREASE_LANE, ACTION_DECREASE_LANE):
+            if q_values[action] == max_q:
+                return action
+        return ACTION_NO_OP
 
-        # TD Error delta = target - Q(s, a) (Slide 31)
-        delta = target - self.q_table[state_idx, action]
-        # TD Q-value update (Slides 31, 44)
-        self.q_table[state_idx, action] += alpha * delta
-        return delta
+    def _probe_reward_scale(self):
+        """Briefly probes environment at startup to calculate optimistic initialization values."""
+        probe_env = HighwayEnv()
+        probe_env.reset(seed=random.randrange(2 ** 31))
+        max_reward = 0.0
+        for _ in range(6):
+            _, reward, done = probe_env.step(ACTION_INCREASE_SPEED)
+            max_reward = max(max_reward, reward)
+            if done:
+                break
+        return max_reward if max_reward > 0 else 0.1
 
-    # ................. Train Agent using Lecture 09 Algorithms .................
     def learn_policy(self, time_limit: float):
         start_time = time.time()
-        max_duration = max(0.1, time_limit - 0.35)
-        df = self.discount_factor
-        step_counter = 0
+        margin = 0.35 if time_limit >= 5 else 0.03
+        max_duration = max(0.05, time_limit - margin)
+        gamma = self.discount_factor
+        n_steps = self.n_steps
 
-        while True:
+        # Compute optimistic initial Q-value bound
+        rmax = self._probe_reward_scale()
+        if gamma < 1.0:
+            self.q0 = rmax * (1.0 - gamma ** self.opt_horizon) / (1.0 - gamma)
+            self.tol = self.tie_frac * rmax / (1.0 - gamma)
+        else:
+            self.q0 = rmax * self.opt_horizon
+            self.tol = 0.0
+
+        replay_buffer = []
+        buffer_pos = 0
+        steps = 0
+        stop_training = False
+
+        while not stop_training:
             elapsed = time.time() - start_time
             if elapsed >= max_duration:
                 break
+                
+            # Time-decaying epsilon exploration
+            epsilon = max(self.eps_min, self.eps_initial * (1.0 - elapsed / max_duration))
 
-            progress = min(1.0, elapsed / max_duration)
-            # Decaying Epsilon & Alpha schedules (Slides 45, 48)
-            epsilon = max(self.epsilon_min, self.epsilon_initial * ((1.0 - progress) ** 1.5))
-            alpha = max(self.alpha_min, self.alpha_initial * (1.0 - 0.7 * progress))
-
-            state = self.env.reset()
-            speed, lane, min_dist = state
-            state_idx = (int(speed) * 2500 + int(lane) * 625 +
-                         int(min_dist[0]) * 125 + int(min_dist[1]) * 25 +
-                         int(min_dist[2]) * 5 + int(min_dist[3]))
+            env = HighwayEnv()
+            speed, lane, min_dist = env.reset(seed=random.randrange(2 ** 31))
+            state, is_flipped = self.encode_state(speed, lane, min_dist)
             done = False
             trajectory = []
 
+            # --- Episode Rollout ---
             while not done:
-                step_counter += 1
-                if (step_counter & 63) == 0:
-                    if time.time() - start_time >= max_duration:
-                        break
+                steps += 1
+                if (steps % 16 == 0) and (time.time() - start_time >= max_duration):
+                    stop_training = True
+                    break
 
-                action = self.select_action(state_idx, epsilon)
-
-                next_state, reward, done = self.env.step(action)
-                next_speed, next_lane, next_min_dist = next_state
-                next_state_idx = (int(next_speed) * 2500 + int(next_lane) * 625 +
-                                  int(next_min_dist[0]) * 125 + int(next_min_dist[1]) * 25 +
-                                  int(next_min_dist[2]) * 5 + int(next_min_dist[3]))
-
-                # 1. Temporal Difference (TD) Q-Learning Step Update (Slides 28-31, 42-44)
-                self.update_q_value(state_idx, action, reward, next_state_idx, done, alpha)
-                trajectory.append((state_idx, action, reward, next_state_idx, done))
-
-                state_idx = next_state_idx
-
-            # 2. Episode Trajectory Credit Assignment:
-            if len(trajectory) > 0:
-                last_reward = trajectory[-1][2]
-                last_done = trajectory[-1][4]
-                if last_done and last_reward < 0:
-                    # Monte Carlo Return G backpropagation for crash episodes (Slides 18-25)
-                    G = last_reward
-                    for s_idx, act, rwd, n_s_idx, dn in reversed(trajectory[:-1]):
-                        G = rwd + df * G
-                        self.q_table[s_idx, act] += alpha * (G - self.q_table[s_idx, act])
+                q_vals = self._get_q_values(state)
+                if random.random() < epsilon:
+                    action = random.randrange(5)
                 else:
-                    # Multi-Pass TD Learning for data-efficient credit propagation (Slides 28-31, 42-44)
-                    for _pass in range(3):
-                        for s_idx, act, rwd, n_s_idx, dn in reversed(trajectory):
-                            if dn:
-                                tgt = rwd
-                            else:
-                                tgt = rwd + df * np.max(self.q_table[n_s_idx])
-                            self.q_table[s_idx, act] += alpha * (tgt - self.q_table[s_idx, act])
+                    action = self._select_greedy_action(q_vals)
 
-    # ......................... Get Action for Evaluation ..........................
+                # Execute action (mirroring lane change if state was flipped)
+                env_action = FLIP_ACTION[action] if is_flipped else action
+                (next_speed, next_lane, next_min_dist), reward, done = env.step(env_action)
+                next_state, next_is_flipped = self.encode_state(next_speed, next_lane, next_min_dist)
+                
+                is_terminal = bool(done and reward < 0)  # Crash event
+                next_q_vals = self._get_q_values(next_state)
+                target = reward if is_terminal else reward + gamma * max(next_q_vals)
+                
+                # 1-step Q-learning update
+                counts = self.N[state]
+                alpha = max(self.lr_min, self.lr_c / (self.lr_c + counts[action]))
+                counts[action] += 1
+                q_vals[action] += alpha * (target - q_vals[action])
+
+                trajectory.append((state, action, reward, next_state, is_terminal))
+                state, is_flipped = next_state, next_is_flipped
+
+            traj_len = len(trajectory)
+            if traj_len == 0:
+                continue
+
+            # --- Multi-step (n-step) Backward Sweep Updates ---
+            for _ in range(2):
+                for t in range(traj_len - 1, -1, -1):
+                    G = 0.0
+                    discount = 1.0
+                    terminal_found = False
+                    last_idx = t
+
+                    for k in range(t, min(t + n_steps, traj_len)):
+                        G += discount * trajectory[k][2]
+                        discount *= gamma
+                        last_idx = k
+                        if trajectory[k][4]:
+                            terminal_found = True
+                            break
+
+                    if not terminal_found:
+                        next_state_q = self._get_q_values(trajectory[last_idx][3])
+                        G += discount * max(next_state_q)
+
+                    s_t, a_t = trajectory[t][0], trajectory[t][1]
+                    counts = self.N[s_t]
+                    alpha = max(self.lr_min, self.lr_c / (self.lr_c + counts[a_t]))
+                    counts[a_t] += 1
+                    self.Q[s_t][a_t] += alpha * (G - self.Q[s_t][a_t])
+
+            # --- Experience Replay Updates ---
+            for transition in trajectory:
+                if len(replay_buffer) < self.replay_cap:
+                    replay_buffer.append(transition)
+                else:
+                    replay_buffer[buffer_pos] = transition
+                    buffer_pos = (buffer_pos + 1) % self.replay_cap
+
+            buf_size = len(replay_buffer)
+            num_replays = int(self.replay_ratio * traj_len)
+            for _ in range(num_replays):
+                s_i, a_i, r_i, ns_i, term_i = replay_buffer[random.randrange(buf_size)]
+                next_q = self._get_q_values(ns_i)
+                target_i = r_i if term_i else r_i + gamma * max(next_q)
+                
+                counts = self.N[s_i]
+                alpha = max(self.lr_min, self.lr_c / (self.lr_c + counts[a_i]))
+                counts[a_i] += 1
+                self.Q[s_i][a_i] += alpha * (target_i - self.Q[s_i][a_i])
+
+        self.total_steps = steps
+
     def get_action(self, speed, lane, min_dist) -> int:
-        state_idx = (int(speed) * 2500 + int(lane) * 625 +
-                     int(min_dist[0]) * 125 + int(min_dist[1]) * 25 +
-                     int(min_dist[2]) * 5 + int(min_dist[3]))
-        return self._greedy_action(state_idx)
+        state, is_flipped = self.encode_state(speed, lane, min_dist)
+        q_values = self._get_q_values(state)
+        action = self._select_greedy_action(q_values)
+        return FLIP_ACTION[action] if is_flipped else action
