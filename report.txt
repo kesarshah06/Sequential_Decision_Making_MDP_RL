@@ -1,0 +1,72 @@
+Preksha Rathal: 2024CS50987
+Kesar Shah: 2024CS10132
+PART A: Treasure Hunt....................................................................................
+
+State Space
+A state is (treasure mask, pirate 1 position, pirate 2 position, ship
+position). The 2-bit treasure mask represents the remaining treasures,
+giving 4 sub-MDPs of size 4 x |P1| x |P2| x N^2.
+
+Transition Model
+-Ship: The intended move succeeds with probability p_s; each other direction has probability 
+(1-p_s)/3. Invalid moves keep the ship in place. Transitions are precomputed in ship_next.
+-Pirates: P1 and P2 are independent transition matrices over their estricted areas. Collision probabilities are precomputed in col_prob.
+-Rewards: Step cost, pirate penalty, treasure bonus, and fort bonus are precomputed in ImmR.
+
+Algorithm
+The 4 sub-MDPs are solved in increasing order of remaining treasures, so
+values for reachable next-masks are already available. Bellman updates are:
+V(s) = max_a sum P(s'|s,a) [R(s,s') + gamma V(s')]
+Pirate expectations are computed using numpy.einsum. Iteration stops when
+the residual is below 1e-4 or the time budget expires. The resulting policy
+is stored as argmax_a Q(s,a) and accessed in O(1).
+
+Functions
+-init: Loads the environment and builds all transition/reward models.
+ (O(N^2 + |P1|^2 + |P2|^2 + |P1||P2|N^2))
+-idx / pos / valid_ship: State encoding, decoding, and validity checks. (O(1) each.)
+-build_ship_transitions: Precomputes ship transitions. (O(N^2))
+-build_pirate_transitions: Builds P1, P2, col_prob, and ImmR. (O(|P1|^2 + |P2|^2 + |P1||P2|N^2))
+-_mask: Converts treasures to a bitmask. (O(T), T <= 2.)
+-compute_full_values: Runs Value Iteration. (O(iter x 4 x |P1||P2|N^2))
+-learn_policy: Runs compute_full_values.
+-get_action: Returns the stored policy action. O(1) after learning.
+
+Call order: init -> build transitions -> get_action -> learn_policy -> compute_full_values
+
+PART B: Highway Driving..............................................................................................
+
+State Representation
+The observation (speed, lane, min_dist[4]) is discretised into:
+Speed: high (>= 3) or low.
+Own-lane distance: 3 levels.
+Left/right distances: 2 levels each.
+Left-right symmetry is used by mirroring states so the clearer adjacent lane is on the right; actions are un-mirrored during execution.
+Learning
+A short probe estimates r_max. Q-values are optimistically initialised as:
+  Q_0 = r_max * (1 - gamma^H) / (1 - gamma),  H = 20
+Epsilon-greedy exploration decreases from 0.5 to 0.02. The learning rate is:
+alpha = max(0.1, 2 / (2 + N(s,a)))
+
+Updates use:
+1-step Q-learning after every step.
+3-step returns, computed backwards twice per episode.
+Experience replay from a circular buffer of capacity 200k, with 3 x episode-length additional samples after each episode.
+
+Functions
+-init: Initialises Q, visit counts, and hyperparameters. O(1)
+-encode_state: Discretises and mirrors the observation. O(1)
+-_get_q_values: Retrieves or initialises Q-values. O(1) amortised
+-_select_greedy_action: Selects the highest-Q action, preferring
+-increase-speed within a small tolerance. O(1)
+-_probe_reward_scale: Estimates r_max using 6 steps. O(1)
+-learn_policy: Trains until the time limit using all update methods.
+-get_action: Encodes the state and returns the greedy action. O(1)
+
+Evaluation
+The final action is selected greedily from the Q-table. A small tolerance
+favours increasing speed when its Q-value is close to the maximum, matching
+the objective of maximising speed.
+
+Call order: init -> learn_policy -> get_action
+

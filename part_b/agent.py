@@ -21,53 +21,42 @@ class Agent:
         self.discount_factor = discount_factor                                                      # Discount factor for future rewards
         self.num_actions = 5                                                                        # Number of available actions
         self.Q = {}                                                                                 # Q-values for each encoded state
-        self.N = {}                                                                                 # Visit counts for each state-action pair (online only)
-
-        self.n_steps = 4                                                                          # Multi-step return horizon
-        self.replay_ratio = 4                                                                     # Replay updates per trajectory step
-        self.replay_cap = 300000                                                                  # Maximum replay buffer size
-        self.opt_horizon = 25                                                                     # Horizon for optimistic Q-initialization
-        self.eps_initial = 0.40                                                                   # Initial exploration rate
-        self.eps_min = 0.01                                                                       # Minimum exploration rate
-        self.lr_c = 3.0                                                                           # Learning rate constant for harmonic decay
-        self.lr_min = 0.05                                                                        # Minimum learning rate floor
-        self.tie_frac = 0.005                                                                     # Tolerance fraction for greedy tie-breaking
-        self.q0 = 0.0                                                                             # Optimistic initialization value (set in learn_policy)
-        self.tol = 0.0                                                                            # Tolerance for greedy tie-breaking (set in learn_policy)
-
+        self.N = {}                                                                                 # Visit counts for each state-action pair
+        
+        self.n_steps = 3                                                                          # Number of steps used in multi-step updates
+        self.replay_ratio = 3
+        self.replay_cap = 200000
+        self.opt_horizon = 20
+        self.eps_initial = 0.5
+        self.eps_min = 0.02
+        self.lr_c = 2.0
+        self.lr_min = 0.1
+        self.tie_frac = 0.01
+        self.q0 = 0.0
+        self.tol = 0.0
+        
+        self._own_map = (3, 1, 2, 3, 3)                                                           # Mapping for obstacles in the current lane
+        self._adj_map = (3, 1, 1, 3, 3)                                                           # Mapping for obstacles in adjacent lanes
         self._wall = 9                                                                             # Sentinel value for unavailable lanes
         self.total_steps = 0                                                                       # Total number of training steps
 
     #..................................................encode the state using discretized sensor inputs..................................................
     def encode_state(self, speed, lane, min_dist):
         """
-        Encodes a richer state representation that captures:
-        - Full discretized speed (not just binary high/low)
-        - Canonical lane position (edge vs interior)
-        - Finer obstacle distance bins per lane
-        - A danger flag for imminent collisions in the current lane
-        Uses left-right symmetry to halve the state space.
+        Discretizes sensor inputs and orders adjacent lane obstacle distances 
+        consistently to exploit horizontal left-right lane symmetry.
         """
-        lane = int(lane)
-        speed = int(speed)
+        lane = int(lane)                                                                           # Ensure the lane index is an integer
+        own = self._own_map[int(min_dist[lane])]                                                    # Aggregate distance in the current lane
+        left = self._adj_map[int(min_dist[lane - 1])] if lane > 0 else self._wall                 # Aggregate distance in the left lane
+        right = self._adj_map[int(min_dist[lane + 1])] if lane < 3 else self._wall                # Aggregate distance in the right lane
+        speed_flag = 1 if int(speed) >= 3 else 0                                                   # Encode high-speed status
 
-        # Distance bins: keep the raw discretized values (0..4) for richer info
-        own = int(min_dist[lane])
-        left = int(min_dist[lane - 1]) if lane > 0 else self._wall
-        right = int(min_dist[lane + 1]) if lane < 3 else self._wall
-
-        # Danger flag: obstacle very close in own lane (distance states 0 or 1)
-        danger = 1 if own <= 1 else 0
-
-        # Lane type: 0 = edge lane (lane 0 or 3), 1 = inner lane (lane 1 or 2)
-        lane_type = 0 if (lane == 0 or lane == 3) else 1
-
-        # Exploit left-right symmetry: canonicalize so left <= right
-        if left > right:
-            state_key = (speed, lane_type, danger, own, right, left)
+        if left > right:                                                                           # Canonicalize state when the left side has more space
+            state_key = (speed_flag * 10 + own) * 100 + right * 10 + left
             return state_key, True
-
-        state_key = (speed, lane_type, danger, own, left, right)
+        
+        state_key = (speed_flag * 10 + own) * 100 + left * 10 + right
         return state_key, False
 
     #..................................................get Q-values and visit counts for a state..................................................
@@ -79,40 +68,16 @@ class Agent:
         return self.Q[state]
 
     #..................................................select a greedy action from the Q-values..................................................
-    def _select_greedy_action(self, q_values, state=None):
-        """
-        Greedy action selection with smart tie-breaking:
-        - When safe (no danger), prefer increasing speed
-        - When in danger, prefer lane change to safer side or decelerate
-        """
-        max_q = max(q_values)
-        tol = self.tol
-
-        # Gather all actions within tolerance of the best
-        candidates = [a for a in range(5) if q_values[a] >= max_q - tol]
-
-        if len(candidates) == 1:
-            return candidates[0]
-
-        # Smart tie-breaking priority depends on whether we're in danger
-        if state is not None and len(state) >= 3:
-            danger = state[2] if len(state) > 2 else 0
-        else:
-            danger = 0
-
-        if danger:
-            # In danger: prefer lane changes (escape), then decelerate, then no-op, then accelerate
-            priority = [ACTION_INCREASE_LANE, ACTION_DECREASE_LANE,
-                       ACTION_DECREASE_SPEED, ACTION_NO_OP, ACTION_INCREASE_SPEED]
-        else:
-            # Safe: prefer accelerate, then no-op, then lane changes
-            priority = [ACTION_INCREASE_SPEED, ACTION_NO_OP,
-                       ACTION_INCREASE_LANE, ACTION_DECREASE_LANE, ACTION_DECREASE_SPEED]
-
-        for action in priority:
-            if action in candidates:
+    def _select_greedy_action(self, q_values):
+        """Greedy action selection with tie-breaking preference for maintaining high speed."""
+        max_q = max(q_values)                                                                       # Find the best estimated action value
+        if q_values[ACTION_INCREASE_SPEED] >= max_q - self.tol:                                    # Prefer increasing speed when nearly tied
+            return ACTION_INCREASE_SPEED
+            
+        for action in (ACTION_NO_OP, ACTION_DECREASE_SPEED, ACTION_INCREASE_LANE, ACTION_DECREASE_LANE):
+            if q_values[action] == max_q:
                 return action
-        return candidates[0]
+        return ACTION_NO_OP
 
     #..................................................probe the environment to estimate the reward scale..................................................
     def _probe_reward_scale(self):
@@ -120,7 +85,7 @@ class Agent:
         probe_env = HighwayEnv()                                                                   # Use a separate environment for probing
         probe_env.reset(seed=random.randrange(2 ** 31))                                           # Randomize the probe start state
         max_reward = 0.0                                                                           # Track the largest observed reward
-        for _ in range(10):
+        for _ in range(6):
             _, reward, done = probe_env.step(ACTION_INCREASE_SPEED)
             max_reward = max(max_reward, reward)
             if done:
@@ -146,32 +111,24 @@ class Agent:
         replay_buffer = []
         buffer_pos = 0
         steps = 0
-        episodes = 0
         stop_training = False
-
-        # Priority replay: track TD errors for prioritized sampling
-        td_errors = []
-        td_pos = 0
 
         while not stop_training:
             elapsed = time.time() - start_time
             if elapsed >= max_duration:
                 break
-
-            # Cosine annealing for epsilon: smoother decay, doesn't hit minimum too early
-            progress = min(1.0, elapsed / max_duration)
-            epsilon = self.eps_min + 0.5 * (self.eps_initial - self.eps_min) * (1.0 + np.cos(np.pi * progress))
+                
+            epsilon = max(self.eps_min, self.eps_initial * (1.0 - elapsed / max_duration))       # Reduce exploration as training time elapses
 
             env = HighwayEnv()
             speed, lane, min_dist = env.reset(seed=random.randrange(2 ** 31))
             state, is_flipped = self.encode_state(speed, lane, min_dist)
             done = False
             trajectory = []
-            episodes += 1
 
             while not done:
                 steps += 1
-                if (steps & 15 == 0) and (time.time() - start_time >= max_duration):
+                if (steps % 16 == 0) and (time.time() - start_time >= max_duration):
                     stop_training = True
                     break
 
@@ -179,21 +136,19 @@ class Agent:
                 if random.random() < epsilon:
                     action = random.randrange(5)
                 else:
-                    action = self._select_greedy_action(q_vals, state)
+                    action = self._select_greedy_action(q_vals)
 
                 env_action = FLIP_ACTION[action] if is_flipped else action
                 (next_speed, next_lane, next_min_dist), reward, done = env.step(env_action)
                 next_state, next_is_flipped = self.encode_state(next_speed, next_lane, next_min_dist)
-
+                
                 is_terminal = bool(done and reward < 0)                                           # Identify crash terminations
                 next_q_vals = self._get_q_values(next_state)                                      # Retrieve next-state estimates
                 target = reward if is_terminal else reward + gamma * max(next_q_vals)              # Compute the temporal-difference target
-
+                
                 counts = self.N[state]                                                            # Retrieve visit counts for the current state
                 alpha = max(self.lr_min, self.lr_c / (self.lr_c + counts[action]))                # Use a decaying learning rate
                 counts[action] += 1                                                               # Record this action visit
-
-                td_error = abs(target - q_vals[action])
                 q_vals[action] += alpha * (target - q_vals[action])                               # Apply the one-step Q-learning update
 
                 trajectory.append((state, action, reward, next_state, is_terminal))
@@ -203,9 +158,7 @@ class Agent:
             if traj_len == 0:
                 continue
 
-            # Multi-step backward sweeps: do more passes for better credit assignment
-            num_sweeps = 3
-            for _sweep in range(num_sweeps):
+            for _ in range(2):
                 for t in range(traj_len - 1, -1, -1):
                     G = 0.0
                     discount = 1.0
@@ -225,56 +178,29 @@ class Agent:
                         G += discount * max(next_state_q)
 
                     s_t, a_t = trajectory[t][0], trajectory[t][1]
-                    q_current = self.Q[s_t][a_t]
-                    # Use a softer learning rate for backward sweeps (not incrementing N)
-                    counts_t = self.N[s_t]
-                    alpha = max(self.lr_min, self.lr_c / (self.lr_c + counts_t[a_t]))
-                    sweep_alpha = alpha * 0.7                                                     # Slightly reduced to avoid instability
-                    self.Q[s_t][a_t] += sweep_alpha * (G - self.Q[s_t][a_t])
+                    counts = self.N[s_t]
+                    alpha = max(self.lr_min, self.lr_c / (self.lr_c + counts[a_t]))
+                    counts[a_t] += 1
+                    self.Q[s_t][a_t] += alpha * (G - self.Q[s_t][a_t])
 
-            # Add to replay buffer with TD errors for prioritized sampling
-            for i, transition in enumerate(trajectory):
-                s_t, a_t, r_t, ns_t, term_t = transition
-                nq = self._get_q_values(ns_t)
-                td_e = abs((r_t if term_t else r_t + gamma * max(nq)) - self.Q[s_t][a_t]) + 0.01
-
+            for transition in trajectory:
                 if len(replay_buffer) < self.replay_cap:
                     replay_buffer.append(transition)
-                    td_errors.append(td_e)
                 else:
                     replay_buffer[buffer_pos] = transition
-                    td_errors[buffer_pos] = td_e
                     buffer_pos = (buffer_pos + 1) % self.replay_cap
 
-            # Prioritized experience replay
             buf_size = len(replay_buffer)
             num_replays = int(self.replay_ratio * traj_len)
-            if buf_size > 0 and num_replays > 0:
-                # Compute sampling probabilities proportional to TD error
-                td_arr = np.array(td_errors[:buf_size], dtype=np.float64)
-                td_arr = td_arr ** 0.6                                                            # Prioritization exponent (alpha in PER)
-                td_sum = td_arr.sum()
-                if td_sum > 0:
-                    probs = td_arr / td_sum
-                else:
-                    probs = np.ones(buf_size, dtype=np.float64) / buf_size
-
-                replay_indices = np.random.choice(buf_size, size=num_replays, p=probs)
-
-                for idx in replay_indices:
-                    s_i, a_i, r_i, ns_i, term_i = replay_buffer[idx]
-                    next_q = self._get_q_values(ns_i)
-                    target_i = r_i if term_i else r_i + gamma * max(next_q)
-
-                    # Use a soft learning rate for replay (don't increment visit counts as aggressively)
-                    counts = self.N[s_i]
-                    alpha = max(self.lr_min, self.lr_c / (self.lr_c + counts[a_i]))
-                    replay_alpha = alpha * 0.5                                                    # Reduced rate for replay stability
-                    old_q = self.Q[s_i][a_i]
-                    self.Q[s_i][a_i] += replay_alpha * (target_i - old_q)
-
-                    # Update TD error for this transition
-                    td_errors[idx] = abs(target_i - old_q) + 0.01
+            for _ in range(num_replays):
+                s_i, a_i, r_i, ns_i, term_i = replay_buffer[random.randrange(buf_size)]
+                next_q = self._get_q_values(ns_i)
+                target_i = r_i if term_i else r_i + gamma * max(next_q)
+                
+                counts = self.N[s_i]
+                alpha = max(self.lr_min, self.lr_c / (self.lr_c + counts[a_i]))
+                counts[a_i] += 1
+                self.Q[s_i][a_i] += alpha * (target_i - self.Q[s_i][a_i])
 
         self.total_steps = steps
 
@@ -282,5 +208,6 @@ class Agent:
     def get_action(self, speed, lane, min_dist) -> int:
         state, is_flipped = self.encode_state(speed, lane, min_dist)
         q_values = self._get_q_values(state)
-        action = self._select_greedy_action(q_values, state)
+        action = self._select_greedy_action(q_values)
         return FLIP_ACTION[action] if is_flipped else action
+    
